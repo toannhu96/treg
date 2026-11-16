@@ -13,6 +13,7 @@ from alembic.config import Config
 from sqlalchemy import inspect
 from sqlalchemy.exc import DBAPIError
 
+from .application.call_record_partitions import ensure_for_release
 from .application.connect import _backfill_provider_extra_tools
 from .infra.db import _db_url, _engine
 
@@ -23,6 +24,7 @@ ReleaseTask = tuple[str, Callable[[], Awaitable[int]]]
 # new code serves traffic. Task bodies remain with their owning subsystem; this is orchestration.
 RELEASE_TASKS: tuple[ReleaseTask, ...] = (
     ("provider companion tools", _backfill_provider_extra_tools),
+    ("call record partitions", ensure_for_release),
 )
 
 # A hot-table ALTER queues behind live traffic for its ACCESS EXCLUSIVE lock, and every later

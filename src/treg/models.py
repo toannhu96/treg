@@ -530,6 +530,10 @@ class Invite(SQLModel, table=True):
     created_at: NaiveUTC = Field(default_factory=_now)
 
 
+# SQLite gives a rowid alias only to a column declared exactly INTEGER PRIMARY KEY.
+_AUDIT_ID = BigInteger().with_variant(Integer(), "sqlite")
+
+
 class CallRecord(SQLModel, table=True):
     """Audit: who called which tool, in which org, when, with what result. Written off the
     request path (fire-and-forget) so it never adds latency to a proxied call.
@@ -571,8 +575,10 @@ class CallRecord(SQLModel, table=True):
                             postgresql_where=text("api_key_id IS NOT NULL"),
                             sqlite_where=text("api_key_id IS NOT NULL")),)
 
-    id: int | None = Field(default=None, primary_key=True)
-    org_id: int | None = Field(default=None, foreign_key="org.id")
+    # 64-bit. On PostgreSQL the table is partitioned by month on `created_at` and its primary key
+    # is (id, created_at); ids come from one sequence, so `id` alone still names one row.
+    id: int | None = Field(default=None, primary_key=True, sa_type=_AUDIT_ID)
+    org_id: int | None = Field(default=None)
     user_email: str = Field(index=True)
     tool_name: str = Field(index=True)
     method: str
@@ -2325,7 +2331,7 @@ class WebArenaCallDayStat(SQLModel, table=True):
 class WebArenaCallCursor(SQLModel, table=True):
     """Last audited call folded into Web Arena's traffic observations."""
     id: str = Field(primary_key=True)
-    call_id: int = 0
+    call_id: int = Field(default=0, sa_type=BigInteger)
     updated_at: NaiveUTC = Field(default_factory=_now)
     observed_since: NaiveUTC | None = None  # start of the one-time shortened observation seed
 
@@ -2335,10 +2341,10 @@ class WebArenaSeedProgress(SQLModel, table=True):
     id: str = Field(primary_key=True)
     observed_since: NaiveUTC
     lagged_until: NaiveUTC
-    first_id: int
-    highwater_id: int
+    first_id: int = Field(sa_type=BigInteger)
+    highwater_id: int = Field(sa_type=BigInteger)
     endpoints: list[str] = Field(sa_type=JSON)
-    last_id: int
+    last_id: int = Field(sa_type=BigInteger)
     endpoint_index: int = 0
     scanned: int = 0
     eligible_calls: int = 0
@@ -2419,7 +2425,7 @@ class ArenaObservation(SQLModel, table=True):
 class ArenaInsightState(SQLModel, table=True):
     """Persistent collection cursor and public aggregate, never raw request/response content."""
     id: str = Field(primary_key=True)
-    cursor: int = 0
+    cursor: int = Field(default=0, sa_type=BigInteger)
     scan_until: NaiveUTC
     updated_at: NaiveUTC | None = None
     payload: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
@@ -2510,7 +2516,7 @@ class EndpointStatCursor(SQLModel, table=True):
     """
 
     id: str = Field(primary_key=True)
-    cursor_id: int = Field(default=0)             # last consumed CallRecord.id
+    cursor_id: int = Field(default=0, sa_type=BigInteger)  # last consumed CallRecord.id
     watermark: NaiveUTC | None = Field(default=None)  # created_at of the last consumed row
     caught_up_at: NaiveUTC | None = Field(default=None)
     updated_at: NaiveUTC = Field(default_factory=_now)
@@ -2594,7 +2600,7 @@ class CallUsageCursor(SQLModel, table=True):
     """
 
     id: str = Field(primary_key=True)
-    cursor_id: int = Field(default=0)
+    cursor_id: int = Field(default=0, sa_type=BigInteger)
     watermark: NaiveUTC | None = Field(default=None)  # created_at of the last folded row
     history_from: str  # YYYY-MM-DD
     caught_up_at: NaiveUTC | None = Field(default=None)
@@ -2801,7 +2807,7 @@ class ShadowCursor(SQLModel, table=True):
     first run starts at the newest call, so the shadow never reads history."""
 
     id: str = Field(primary_key=True)
-    cursor_id: int = Field(default=0)             # last consumed CallRecord.id
+    cursor_id: int = Field(default=0, sa_type=BigInteger)  # last consumed CallRecord.id
     updated_at: NaiveUTC = Field(default_factory=_now)
 
 
@@ -2813,7 +2819,7 @@ class ShadowPair(SQLModel, table=True):
 
     id: int | None = Field(default=None, primary_key=True)
     created_at: NaiveUTC = Field(default_factory=_now, index=True)
-    call_id: int = Field(default=0)
+    call_id: int = Field(default=0, sa_type=BigInteger)
     capability: str = Field(index=True)
     endpoint_id: str = Field(default="")          # the served provider's endpoint
     subject: str = Field(default="")              # salted hash of the normalized identity

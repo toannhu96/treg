@@ -61,6 +61,11 @@ sources:
   - src/treg/alembic/versions/0070_api_key_spend_rollup.py
   - src/treg/alembic/versions/0072_callrecord_call_ref_index.py
   - src/treg/alembic/versions/0073_org_flow_control_version.py
+  - src/treg/alembic/versions/0115_call_record_id_references_bigint.py
+  - src/treg/alembic/versions/0116_call_record_partitioned_table.py
+  - src/treg/alembic/versions/0117_call_record_swap.py
+  - src/treg/application/call_record_partitions.py
+  - tests/test_call_record_partitions.py
   - tests/test_org_flow_control_schema.py
   - src/treg/alembic/versions/0096_route_rule_version.py
   - src/treg/alembic/versions/0097_referral_affiliate.py
@@ -225,8 +230,9 @@ and keeping snapshots immutable are the private admin's job; the call path never
 
 ## `CallRecord` and `LedgerEntry`: indexes are throughput
 
-`CallRecord` (audit) and `LedgerEntry` (append-only, never pruned) are the largest tables and both
-only grow. Every time-window question needs an index whose leading columns match the filter and
+`CallRecord` (audit) and `LedgerEntry` (append-only, never pruned) are the largest tables.
+`LedgerEntry` only grows. `CallRecord` grows until an operator turns its retention on (next
+section). Every time-window question needs an index whose leading columns match the filter and
 end in `created_at`; otherwise the planner picks an index on the other column and filters the date
 in memory, reading a team's or an endpoint's whole history. All pools share one Postgres, so one
 such scan queues every other query and the API pool empties into `503 treg_saturated`
@@ -301,6 +307,95 @@ Redaction in `application.call.evidence` is security-sensitive and order matters
 3. Apply pattern masking, then re-scan a percent-decoded, JSON-unescaped, lowercased copy.
    A rendering failure or surviving secret replaces the whole snippet.
 4. Truncate only after masking, so a partial credential cannot escape exact matching.
+
+## `CallRecord`: monthly partitions and a 64-bit id
+
+On PostgreSQL `callrecord` is partitioned by month on `created_at`, and its id is `bigint`
+(alembic `0115` to `0117`). Two limits of the plain table are the reason: a 32-bit id ends at
+2,147,483,647, and changing its type in place rewrites the table under an ACCESS EXCLUSIVE lock;
+and a plain table gives space back only through `DELETE`, which leaves the files as large as they
+were. A month partition is dropped whole. SQLite keeps one plain table (its ids are 64-bit
+already), as does a PostgreSQL database built from the models, and the code below is a no-op there.
+
+**Shape.**
+
+- The primary key is `(id, created_at)`, because a unique constraint on a partitioned table must
+  include the partition column. Every id comes from one sequence, so `id` alone still names one
+  row; that, not a constraint, is what the model's `primary_key` on `id` and `db.get(CallRecord, id)`
+  rest on. Never insert an explicit id.
+- The table has the same name, columns and index names as before, so readers did not change. Each
+  index exists once per partition. A read bounded by `created_at` touches only its months. A read
+  by `id`, `call_ref` or `(org_id, id)` probes that index in every partition and merges them,
+  which stays cheap while each probe is bounded: keep the `LIMIT` or the id range such reads have.
+- There is no foreign key to `org`: it would lock the `org` row on every audit insert. Team
+  deletion removes a team's rows itself (`ORG_SCOPED_MODELS`).
+- `CREATE INDEX CONCURRENTLY` does not work on a partitioned table. A new index is built
+  concurrently on each partition, then attached to an index created `ON ONLY callrecord`.
+- Columns that store a call record id are `bigint`: the rollup cursors (`callusagecursor`,
+  `endpointstatcursor`, `shadowcursor`, `webarenacallcursor`, `arenainsightstate`,
+  `webarenaseedprogress`, `showcasecursor`) and `shadowpair.call_id`. `arenaobservation.id` is
+  still `integer`; it must be widened before call record ids pass the 32-bit range.
+
+**Partition upkeep** (`application/call_record_partitions.py`, the only writer of partitions). A
+row whose month has no partition is refused, and the audit writer then drops it and logs an error,
+so the coming months must exist first. `maintain()` creates the current month and the next
+`MONTHS_AHEAD`; it runs at every release (`maintenance.RELEASE_TASKS`), in the
+`treg-worker usage rollup` cron, and as `treg-worker admin callrecord-partitions`. A partition is
+created as a plain table and attached, which takes SHARE UPDATE EXCLUSIVE on `callrecord`, so
+inserts and reads do not wait; `CREATE TABLE ... PARTITION OF` would take ACCESS EXCLUSIVE. There
+is no default partition for the same reason: every attach would lock and scan it, and
+`DETACH ... CONCURRENTLY` refuses to run beside one.
+
+**Retention** is `TREG_CALLRECORD_RETENTION_MONTHS`, 0 by default, which keeps every month. With
+`N`, `maintain()` detaches (`DETACH PARTITION ... CONCURRENTLY`) and drops each partition older
+than the `N` full months before the current one. What goes with a month: its rows in Activity and
+`/calls`, the link behind `GET /calls/{id}/result`, and its failure evidence. What stays: the
+rollups (`CallUsageDay`, `EndpointDayStat`, `ApiKeySpendDay`) and the ledger. The readers that
+rebuild from call records look back 31 days at most, and `N` = 1 always keeps more than that, so
+`N` below 1 is not offered. Writing a detached month to object storage before dropping it is not
+built: the place for it is between the detach and the drop in `drop_expired`.
+
+**The swap** from the plain table. The history is copied first and the tables trade names last,
+so no reader ever sees a table with part of its history, and only the rename blocks anyone:
+
+1. `0115` widens the columns that store a call record id.
+2. `0116` creates the empty partitioned table `callrecord_partitioned` beside the live one, on
+   the same id sequence (changed to `bigint`), so ids continue and every cursor stays valid.
+3. `treg-worker admin callrecord-backfill --days N` copies the last `N` days into it, newest
+   first, in bounded transactions beside live traffic, for as long as that takes; run again, it
+   resumes, and first copies what was written since. By default a batch is 5,000 rows followed by
+   a 0.5 s pause (`--batch-rows`, `--pause-seconds`), so the copy leaves the primary and its
+   replicas room; the new table grows by about the size of the rows copied, and the legacy
+   table keeps its space until step 5, so check disk headroom and watch replica lag while it runs. A small table skips this step: `0117` copies
+   it whole.
+4. `0117` copies what was written since, takes the late `hit`/`verdict` values of the last two
+   days from the live table, copies again what was written while that ran (so the locked step
+   copies at most a few hundred new rows however long the resync took; a retry after a lock
+   timeout resyncs only above the id the attempt before reached, noted on the new table for
+   `_RESYNC_REUSE`), then in one transaction locks both tables, copies the last rows,
+   trades the table and index names, moves the sequence and repeats the old table's grants. Audit
+   inserts wait for that transaction and land in the new table. The old table stays as
+   `callrecord_legacy`; an empty one is dropped. Rows of teams deleted during the copy are removed.
+5. `treg-worker admin callrecord-drop-legacy` removes the legacy table. Before that, the same
+   backfill command copies still older history from it into `callrecord` if it is wanted.
+
+`0117` refuses to swap a large table whose copy does not reach back 31 days (or to the first row)
+and changes nothing. The reason is the readers that count "today" or rebuild a recent window from
+call records: the trial allowance (`_trial_calls_today`), the spend recount, a catalog day repair
+(`_repair_bucket`), a new usage or Arena cursor. On a table holding only its newest rows they
+would give wrong answers without an error. To copy before the release that carries `0117` is
+deployed, apply the first two revisions alone (`alembic upgrade 0116`) and run the backfill from
+a checkout of that release; older code serves unchanged on that schema.
+
+Why a copy and not a view or two reads: a view over both tables must cast the legacy `integer` id
+to `bigint`, and a cast column cannot use the legacy indexes, so every read by id would scan the
+legacy table; reading both tables in code would change every reader and writer of the table. The
+copy keeps one table and one read path, and the legacy table is only a source.
+
+While `callrecord_legacy` exists: nothing writes it; team deletion deletes the team's rows from it
+(`cascade_delete_org`), which its foreign key to `org` requires; and dropping it takes a brief
+ACCESS EXCLUSIVE lock on `org` to remove that foreign key, which `drop_legacy` bounds with a lock
+timeout and retries.
 
 ## `IdempotentCall`
 

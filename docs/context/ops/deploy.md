@@ -421,6 +421,17 @@ job's credentials. `treg-worker --help` lists them; what follows is what a sched
   when R2 writes are on ([archive](../architecture/archive.md), "Row retention").
 - **`admin purge-evidence`** and **`admin purge-ad-clicks`**: daily. Without them expired rows stop
   being shown or read but stay in the database.
+- **Call record partitions** (PostgreSQL). `usage rollup` creates the coming month partitions of
+  `callrecord` before it folds, and every release does the same, so a deployment needs one of the
+  two at least once every three months; without a partition for the month, audit rows are refused
+  and logged. A `usage rollup` run whose partition upkeep failed still folds, logs
+  "callrecord partition upkeep failed" as an error and exits 1, so alert on either. `admin callrecord-partitions` does only that step. With
+  `TREG_CALLRECORD_RETENTION_MONTHS` set, the same step drops expired months. The upgrade that
+  partitions the table refuses a large `callrecord` until `admin callrecord-backfill --days N`
+  (N of 31 or more) has copied its history; that command needs only the database, not
+  `verify_db()`, because its first use is on a schema one revision behind. Afterwards
+  `admin callrecord-drop-legacy` removes the old table
+  ([data model](../architecture/data-model.md), "monthly partitions and a 64-bit id").
 - **`hub check`** runs each live [hub](../architecture/hub.md) tool's `check.json` as its maker
   (spending the maker's balance); health is derived from the last three runs.
 - **`jev xboost`** needs `TREG_JEV_TREG_TOKEN` (a member token, so its spend is an ordinary bill) and

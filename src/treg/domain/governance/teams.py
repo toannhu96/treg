@@ -5,7 +5,7 @@ import re
 import sys
 from datetime import datetime
 
-from sqlalchemy import delete, exists, func, update
+from sqlalchemy import delete, exists, func, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlmodel import select
@@ -540,6 +540,11 @@ async def cascade_delete_org(org: Org, db: AsyncSession) -> None:
     # the FK walk in the guard test never sees these rows; they are the team's all the same. A
     # deletion that should also clear the object store runs `archive_erasure.erase_org` first.
     await erase_archive_rows(db, org.id)
+    # Until an operator drops it, the table `callrecord` replaced (alembic 0117) holds the team's
+    # older calls and a foreign key to this org row.
+    if db.get_bind().dialect.name == "postgresql" and (await db.execute(
+            text("SELECT to_regclass('callrecord_legacy')"))).scalar() is not None:
+        await db.execute(text("DELETE FROM callrecord_legacy WHERE org_id = :org_id"), {"org_id": org.id})
     await db.delete(org)
 
 
